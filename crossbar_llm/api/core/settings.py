@@ -4,7 +4,7 @@ from pydantic_settings import (
     BaseSettings,
     SettingsConfigDict
 )
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from crossbar_llm.agent_tools.config import ConfigPaths
 
@@ -18,6 +18,31 @@ class EnvSettings(BaseSettings):
     app_env: Literal["development", "production"] = Field(default="development", alias="APP_ENV")
     browser_cookie_secret: SecretStr = Field(alias="BROWSER_COOKIE_SECRET")
     rate_limit_ip_hash_secret: SecretStr = Field(alias="RATE_LIMIT_IP_HASH_SECRET")
+    paperclip_api_key: SecretStr | None = Field(
+        default=None,
+        alias="PAPERCLIP_API_KEY",
+    )
+    # Typed as a real bool so `PAPERCLIP_DISABLE_REST=false` means false. The
+    # adapter's own env fallback is a bare truthiness check, where that same
+    # value would *enable* the flag; parsing it here is what makes the setting
+    # behave the way anyone would read it.
+    paperclip_disable_rest: bool | None = Field(
+        default=None,
+        alias="PAPERCLIP_DISABLE_REST",
+    )
+
+    @field_validator("paperclip_api_key", "paperclip_disable_rest", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value):
+        """Treat `KEY=` in a .env as "not configured" rather than as a value.
+
+        `.env.example` ships these keys empty, so a verbatim copy must start
+        cleanly — without this, the empty string fails bool parsing and takes
+        the whole app down at import.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
 
 class Settings(BaseModel):
@@ -97,6 +122,91 @@ class Settings(BaseModel):
 
     max_upload_size_mb: int = 5
 
+    # Optional literature agents
+    literature_tool_timeout_seconds: float = Field(
+        default=180.0,
+        gt=0,
+        description="Maximum runtime for each optional literature tool.",
+    )
+    literature_max_citations: int = Field(
+        default=10,
+        ge=1,
+        description="Maximum citations returned per literature tool.",
+    )
+    literature_max_concurrent_runs: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "How many literature tool runs may be in flight at once in this "
+            "process. Each run fans out several requests upstream, so without "
+            "a ceiling a burst of traffic multiplies straight through to the "
+            "external services and exhausts the connection pool."
+        ),
+    )
+    literature_admission_wait_seconds: float = Field(
+        default=5.0,
+        ge=0,
+        description=(
+            "How long a run waits for an admission slot before being reported "
+            "as skipped. Short on purpose: queueing here would silently eat "
+            "the per-tool timeout budget instead of failing legibly."
+        ),
+    )
+    pubtator3_replica_count: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            "Number of API replicas sharing one egress IP. PubTator3's 3 req/s "
+            "ceiling is enforced per IP, so each replica takes a 1/N share. "
+            "Leave at 1 for a single instance; raise it when scaling out, or "
+            "replace the limiter with a coordinated one."
+        ),
+    )
+    paperclip_max_documents: int = Field(
+        default=7,
+        ge=1,
+        description="Papers Paperclip retrieves per question.",
+    )
+    paperclip_abstracts_only: bool = Field(
+        default=True,
+        description=(
+            "Force Paperclip to title+abstract retrieval. Cheaper and more "
+            "predictable in tokens than pulling full bodies."
+        ),
+    )
+    paperclip_use_map: bool = Field(
+        default=False,
+        description=(
+            "Let Paperclip read full text server-side and extract a per-paper "
+            "answer. Off by default: it costs one upstream call PER PAPER, so "
+            "it multiplies our request rate against a metered service by "
+            "`paperclip_max_documents`. Turn on only with headroom to spare."
+        ),
+    )
+    paperclip_max_connections: int = Field(
+        default=64,
+        ge=1,
+        description=(
+            "HTTP connection cap for the shared Paperclip adapter. This is a "
+            "process-wide pool, so it bounds every concurrent request at once "
+            "rather than one request's ~14-wide fan-out."
+        ),
+    )
+    pubtator3_max_documents: int = Field(
+        default=7,
+        ge=1,
+        description="Papers PubTator3 exports per question.",
+    )
+    pubtator3_abstracts_only: bool = Field(
+        default=True,
+        description=(
+            "Force PubTator3 to title+abstract retrieval. On by default: full "
+            "text also short-circuits the depth-refinement second pass, and "
+            "PubTator3's 3 req/s ceiling is IP-wide, so fewer and smaller "
+            "fetches per question is what keeps the service usable under load."
+        ),
+    )
+
     # CORS
     allowed_origins: list[str] = Field(
         default=[
@@ -140,6 +250,4 @@ class Settings(BaseModel):
 
 
     
-
-
 

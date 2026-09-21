@@ -67,6 +67,7 @@ async def _ainvoke_structured_with_json_fallback(
     schema: type[StructuredModel],
     values: dict[str, Any],
     json_instruction: str,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[StructuredModel, bool]:
     """Use provider structured output first, then retry as plain JSON.
 
@@ -78,7 +79,10 @@ async def _ainvoke_structured_with_json_fallback(
     structured_error: Exception | None = None
     try:
         chain = prompt | chat_model.with_structured_output(schema)
-        parsed = await chain.ainvoke(values)
+        if metadata:
+            parsed = await chain.ainvoke(values, config={"metadata": metadata})
+        else:
+            parsed = await chain.ainvoke(values)
         if parsed is not None:
             if isinstance(parsed, schema):
                 return parsed, False
@@ -91,7 +95,11 @@ async def _ainvoke_structured_with_json_fallback(
 
     json_prompt = prompt + HumanMessagePromptTemplate.from_template(json_instruction)
     try:
-        msg = await (json_prompt | chat_model).ainvoke(values)
+        chain = json_prompt | chat_model
+        if metadata:
+            msg = await chain.ainvoke(values, config={"metadata": metadata})
+        else:
+            msg = await chain.ainvoke(values)
         data = _extract_json_object(_message_content_to_text(msg))
         return schema.model_validate(data), True
     except Exception as json_error:

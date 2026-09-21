@@ -133,6 +133,7 @@ def build_graph(
                 "Return ONLY a valid JSON object for that schema. Do not use "
                 "Markdown, prose, tool calls, or extra keys."
             ),
+            metadata={"node_name": "pubtator3.router"},
         )
 
     async def router_node(state: PubTator3State) -> dict:
@@ -272,12 +273,15 @@ def build_graph(
                 ),
             ])
             chain = prompt | chat_model
-            msg = await chain.ainvoke({
-                "question": state["question"],
-                "evidence": evidence,
-                "availability_note": availability_note,
-                "chat_history": state.get("chat_history", []),
-            })
+            msg = await chain.ainvoke(
+                {
+                    "question": state["question"],
+                    "evidence": evidence,
+                    "availability_note": availability_note,
+                    "chat_history": state.get("chat_history", []),
+                },
+                config={"metadata": {"node_name": "pubtator3.synthesize"}},
+            )
             answer = msg.content if isinstance(msg.content, str) else str(msg.content)
         return {"final_answer": answer}
 
@@ -332,6 +336,7 @@ def build_graph(
                         "Return ONLY a valid JSON object for the depth-evaluation "
                         "schema. Do not use Markdown, prose, tool calls, or extra keys."
                     ),
+                    metadata={"node_name": "pubtator3.evaluate_depth"},
                 )
                 if used_json_fallback:
                     warnings.append(
@@ -388,7 +393,10 @@ def build_graph(
             "warnings": warnings,
         }
 
-    def _post_evaluate_route(state: PubTator3State) -> str:
+    async def _question_type_route(state: PubTator3State) -> str:
+        return state["question_type"]
+
+    async def _post_evaluate_route(state: PubTator3State) -> str:
         if state.get("depth_sufficient", True):
             return "end"
         if not state.get("refinement_attempted"):
@@ -409,7 +417,7 @@ def build_graph(
     g.set_entry_point("router")
     g.add_conditional_edges(
         "router",
-        lambda s: s["question_type"],
+        _question_type_route,
         {
             "out_of_scope": END,
             "single_node": "resolve",
@@ -420,7 +428,7 @@ def build_graph(
     )
     g.add_conditional_edges(
         "resolve",
-        lambda s: s["question_type"],
+        _question_type_route,
         {
             "single_node": "search",
             "relation_known_pair": "search",

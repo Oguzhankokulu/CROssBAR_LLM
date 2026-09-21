@@ -397,8 +397,14 @@ def _api_key() -> str:
     return key
 
 
-async def _paperclip_tool(*, timeout_s: float = DEFAULT_TIMEOUT_S):
-    """Lazily load and cache the single `paperclip` MCP tool for this loop."""
+async def _paperclip_tool(*, timeout_s: float = DEFAULT_TIMEOUT_S, api_key: str | None = None):
+    """Lazily load and cache the single `paperclip` MCP tool for this loop.
+
+    `api_key` overrides the environment for callers that hold their credentials
+    in config rather than `os.environ`. The cache is keyed by loop alone, not by
+    key: one process authenticates as one Paperclip account, so a second key on
+    the same loop would be a configuration error rather than a case to support.
+    """
     loop = asyncio.get_running_loop()
     tool = _tools_by_loop.get(loop)
     if tool is not None:
@@ -413,7 +419,7 @@ async def _paperclip_tool(*, timeout_s: float = DEFAULT_TIMEOUT_S):
             "paperclip": {
                 "transport": "streamable_http",
                 "url": MCP_URL,
-                "headers": {"X-API-Key": _api_key()},
+                "headers": {"X-API-Key": api_key or _api_key()},
                 "timeout": timeout_s,
                 # Explicit, not left to the library default — see SLOW_TIMEOUT_S.
                 "sse_read_timeout": timeout_s,
@@ -901,17 +907,51 @@ class PaperclipAdapter:
         *,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         slow_timeout_s: float = SLOW_TIMEOUT_S,
+        api_key: str | None = None,
+        disable_rest: bool | None = None,
+        max_connections: int = 32,
+        pool_timeout_s: float = 10.0,
     ):
         self._timeout_s = timeout_s
         self._slow_timeout_s = slow_timeout_s
+        # How long a call may wait for a free connection when the pool is
+        # saturated. Kept well below the call timeouts on purpose: passing a
+        # bare float to httpx sets connect/read/write/pool to the SAME value,
+        # so queueing silently consumed the whole 60s (or 480s) budget and
+        # surfaced as "Paperclip is slow" rather than "we are out of
+        # connections". A short, separate pool timeout makes saturation fail
+        # fast and legibly.
+        self._pool_timeout_s = pool_timeout_s
+        # Explicit credentials beat the environment. Callers that load config
+        # from a file (the API reads `.env` through pydantic-settings, which
+        # never exports to `os.environ`) can hand them over directly instead of
+        # mutating process-global state to get them here.
+        self._api_key = api_key
+        self._disable_rest = disable_rest
+        self._max_connections = max_connections
         # One pooled HTTP client per event loop, per adapter. Per-loop because
-        # an AsyncClient binds to the loop it was created on; per-adapter (not
-        # module-global) because `build_graph` constructs one adapter per run,
-        # so pooling stays scoped to a single user's request rather than shared
-        # across everyone.
+        # an AsyncClient binds to the loop it was created on; per-adapter
+        # because an adapter may be either request-scoped (`build_graph`
+        # constructs one per run when none is injected) or process-wide (the
+        # API injects a single long-lived adapter). `max_connections` is a cap
+        # on THIS adapter, so a shared one needs it raised: it then bounds
+        # every concurrent request at once rather than one request's fan-out.
         self._clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
             weakref.WeakKeyDictionary()
         )
+
+    def _rest_disabled(self) -> bool:
+        """Whether the REST transport is turned off for this adapter.
+
+        An explicit `disable_rest=False` wins over the environment, so an API
+        caller can force REST on regardless of ambient configuration. Only when
+        nothing was passed does the env var decide — and there, note that the
+        check is presence-and-truthiness, so `PAPERCLIP_DISABLE_REST=false`
+        disables REST just like `=1` does. Prefer passing the flag.
+        """
+        if self._disable_rest is not None:
+            return self._disable_rest
+        return bool(os.environ.get(DISABLE_REST_ENV))
 
     def _rest_client(self) -> "httpx.AsyncClient":
         """The pooled client for this loop, created on first use.
@@ -925,8 +965,11 @@ class PaperclipAdapter:
         if client is None or client.is_closed:
             client = httpx.AsyncClient(
                 # Keep-alive headroom for the fan-out; `max_connections` caps
-                # how hard one request can hit Paperclip concurrently.
-                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+                # how hard this adapter can hit Paperclip concurrently.
+                limits=httpx.Limits(
+                    max_connections=self._max_connections,
+                    max_keepalive_connections=max(1, self._max_connections // 2),
+                ),
                 follow_redirects=True,
             )
             self._clients[loop] = client
@@ -957,7 +1000,9 @@ class PaperclipAdapter:
         costs nothing on the common path, and avoids under-timing out a
         `map` call that happens to fall back to MCP.
         """
-        tool = await _paperclip_tool(timeout_s=self._slow_timeout_s)
+        tool = await _paperclip_tool(
+            timeout_s=self._slow_timeout_s, api_key=self._api_key
+        )
         try:
             out = await tool.ainvoke({"command": command})
         except PaperclipError:
@@ -984,11 +1029,19 @@ class PaperclipAdapter:
         client's headers, so rotating `PAPERCLIP_API_KEY` takes effect without
         rebuilding the client.
         """
-        if os.environ.get(DISABLE_REST_ENV):
+        if self._rest_disabled():
             raise PaperclipRestUnavailable(f"disabled via {DISABLE_REST_ENV}")
-        key = _api_key()
+        key = self._api_key or _api_key()
 
-        timeout = self._slow_timeout_s if verb in _SLOW_COMMANDS else self._timeout_s
+        call_timeout = self._slow_timeout_s if verb in _SLOW_COMMANDS else self._timeout_s
+        # Explicit per-phase timeouts: `pool` (waiting for a free connection)
+        # gets its own short budget instead of inheriting the call timeout.
+        timeout = httpx.Timeout(
+            connect=call_timeout,
+            read=call_timeout,
+            write=call_timeout,
+            pool=self._pool_timeout_s,
+        )
         try:
             resp = await self._rest_client().post(
                 REST_URL,
@@ -996,6 +1049,16 @@ class PaperclipAdapter:
                 headers={"X-API-Key": key},
                 timeout=timeout,
             )
+        except httpx.PoolTimeout as e:
+            # Distinct from an upstream failure: Paperclip is fine, we ran out
+            # of local connections. Raised as RestUnavailable so the caller's
+            # existing MCP fallback still applies, but named so the logs say
+            # which it was.
+            raise PaperclipRestUnavailable(
+                f"connection pool exhausted after {self._pool_timeout_s:g}s "
+                f"(max_connections={self._max_connections}); too many concurrent "
+                f"Paperclip requests in this process"
+            ) from e
         except Exception as e:  # network errors, timeouts
             raise PaperclipRestUnavailable(f"{type(e).__name__}: {e}") from e
         # 401/429 are account-level verdicts, not transport failures: MCP
@@ -1251,7 +1314,7 @@ class PaperclipAdapter:
         it just adds an `ERR:`-prefixed warning on top of the same (possibly
         empty) result — no simpler than handling an empty result ourselves.
         """
-        if os.environ.get(DISABLE_REST_ENV):
+        if self._rest_disabled():
             return None
         raw = f"--from {search_id} {_shell_quote(query)}"
         try:

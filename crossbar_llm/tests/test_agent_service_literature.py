@@ -1,0 +1,300 @@
+import asyncio
+import os
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+os.environ.setdefault("BROWSER_COOKIE_SECRET", "test-browser-secret")
+os.environ.setdefault("RATE_LIMIT_IP_HASH_SECRET", "test-rate-limit-secret")
+
+from crossbar_llm.agent_tools.callback_handler import UsageMetricsCallback, UsageRecord
+from crossbar_llm.agent_tools.cypher_agent import CypherAgent
+from crossbar_llm.api.schemas.requests import DbSearchRequest, LiteratureToolsConfig
+from crossbar_llm.api.services.agent_service import AgentService
+
+
+class _Graph:
+    def __init__(self, result=None, started=None, release=None):
+        self.result = result or {"is_ok": True, "final_answer": "graph answer"}
+        self.started = started
+        self.release = release
+
+    async def ainvoke(self, state, config):
+        if self.started:
+            self.started.set()
+        if self.release:
+            await self.release.wait()
+        return {**state, **self.result}
+
+
+def _payload(*, execution_mode="generate_and_run"):
+    return DbSearchRequest(
+        provider="openai",
+        model="gpt-4o-mini",
+        question="What is the role of EGFR in cancer?",
+        execution_mode=execution_mode,
+        literature_tools=LiteratureToolsConfig(paperclip=True, pubtator3=True),
+    )
+
+
+def _service(literature_run):
+    service = AgentService.__new__(AgentService)
+    service.literature_service = SimpleNamespace(run=literature_run)
+    return service
+
+
+def test_graph_topology_is_identical_with_and_without_preflight():
+    """The preflight must not change the compiled graph.
+
+    A request and its later resume share one checkpointer, so if enabling
+    literature tools rewired the entry point, the resume would be replaying a
+    checkpoint written by a differently-shaped graph.
+    """
+    agent = object.__new__(CypherAgent)
+    agent.benchmark_mode = False
+    agent.debug_mode = False
+
+    edges = {
+        (edge.source, edge.target)
+        for edge in agent.build_graph(checkpointer=None).get_graph().edges
+    }
+
+    assert ("__start__", "biological_relevance_validation") in edges
+
+
+def test_prevalidated_state_skips_the_second_relevance_call():
+    """A seeded verdict must not be re-paid for inside the graph."""
+    agent = object.__new__(CypherAgent)
+    agent.llm_factory = SimpleNamespace(
+        create_biological_relevance_validator_llm=lambda: (_ for _ in ()).throw(
+            AssertionError("relevance was re-validated despite a seeded verdict")
+        )
+    )
+
+    result = agent.biological_relevance_validation_node(
+        {"question": "What is EGFR?", "biological_relevance": True}
+    )
+
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_question_skips_core_and_literature(monkeypatch):
+    async def unexpected_literature(**kwargs):
+        raise AssertionError("literature tools should not run")
+
+    service = _service(unexpected_literature)
+    graph = _Graph(result={"is_ok": False})
+    agent = SimpleNamespace(
+        avalidate_biological_relevance=AsyncMock(return_value={
+            "biological_relevance": False,
+            "final_answer": "outside the biological domain",
+        })
+    )
+    callback = UsageMetricsCallback("session", strict=False)
+    monkeypatch.setattr(
+        service,
+        "_build_agent_graph",
+        lambda **kwargs: (graph, agent, callback, {}),
+    )
+
+    result, literature, literature_callback = await service._run_initial_request(
+        session_id="session",
+        browser_id="browser",
+        payload=_payload(),
+        initial_state={"question": "What is the stock price?", "is_ok": False},
+        usage_callback=callback,
+    )
+
+    assert result["biological_relevance"] is False
+    assert result["final_answer"] == "outside the biological domain"
+    assert literature is None
+    assert literature_callback is None
+
+
+@pytest.mark.asyncio
+async def test_core_and_literature_start_in_parallel_after_relevance_gate(monkeypatch):
+    started = {"core": asyncio.Event(), "literature": asyncio.Event()}
+    release = asyncio.Event()
+
+    async def literature_run(**kwargs):
+        started["literature"].set()
+        await release.wait()
+        return {"paperclip": {"status": "completed"}}
+
+    service = _service(literature_run)
+    graph = _Graph(started=started["core"], release=release)
+    agent = SimpleNamespace(
+        avalidate_biological_relevance=AsyncMock(return_value={
+            "biological_relevance": True,
+            "final_answer": None,
+        })
+    )
+    callback = UsageMetricsCallback("session", strict=False)
+    monkeypatch.setattr(
+        service,
+        "_build_agent_graph",
+        lambda **kwargs: (graph, agent, callback, {}),
+    )
+
+    task = asyncio.create_task(
+        service._run_initial_request(
+            session_id="session",
+            browser_id="browser",
+            payload=_payload(),
+            initial_state={"question": "What is EGFR?"},
+            usage_callback=callback,
+        )
+    )
+    await asyncio.wait_for(
+        asyncio.gather(*(event.wait() for event in started.values())),
+        timeout=1,
+    )
+    release.set()
+    result, literature, literature_callback = await task
+
+    assert result["biological_relevance"] is True
+    assert literature["paperclip"]["status"] == "completed"
+    # Literature gets its own lenient handler so the core agent keeps strict
+    # usage accounting.
+    assert literature_callback is not None and literature_callback.strict is False
+
+
+@pytest.mark.asyncio
+async def test_generate_only_does_not_start_literature(monkeypatch):
+    async def unexpected_literature(**kwargs):
+        raise AssertionError("literature tools should wait for resume")
+
+    service = _service(unexpected_literature)
+    graph = _Graph()
+    agent = SimpleNamespace()
+    callback = UsageMetricsCallback("session", strict=False)
+
+    monkeypatch.setattr(
+        service,
+        "_build_agent_graph",
+        lambda **kwargs: (graph, agent, callback, {}),
+    )
+
+    result, literature, literature_callback = await service._run_initial_request(
+        session_id="session",
+        browser_id="browser",
+        payload=_payload(execution_mode="generate"),
+        initial_state={"question": "What is EGFR?"},
+        usage_callback=callback,
+    )
+
+    assert result["final_answer"] == "graph answer"
+    assert literature is None
+    assert literature_callback is None
+
+
+@pytest.mark.asyncio
+async def test_core_failure_cancels_literature_instead_of_orphaning_it():
+    """A failing Cypher graph must not leave literature agents running.
+
+    `asyncio.gather` without `return_exceptions` propagates the first error but
+    leaves siblings running, so a bare gather here let the literature agents
+    carry on spending metered Paperclip calls and LLM tokens long after the
+    request had already failed.
+    """
+    literature_finished = False
+    literature_cancelled = False
+
+    async def literature_run(**kwargs):
+        nonlocal literature_finished, literature_cancelled
+        try:
+            await asyncio.sleep(0.5)
+            literature_finished = True
+            return {"paperclip": {"status": "completed"}}
+        except asyncio.CancelledError:
+            literature_cancelled = True
+            raise
+
+    class _FailingGraph:
+        async def ainvoke(self, state, config):
+            await asyncio.sleep(0.01)
+            raise RuntimeError("neo4j exploded")
+
+    service = _service(literature_run)
+
+    with pytest.raises(RuntimeError, match="neo4j exploded"):
+        await service._gather_core_and_literature(
+            graph=_FailingGraph(),
+            initial_state={},
+            config={},
+            question="What is EGFR?",
+            payload=_payload(),
+            literature_callback=UsageMetricsCallback("session", strict=False),
+        )
+
+    # Give an orphaned task the time it would have needed to finish.
+    await asyncio.sleep(0.6)
+    assert literature_cancelled is True
+    assert literature_finished is False
+
+
+@pytest.mark.asyncio
+async def test_literature_failure_cancels_the_core_graph():
+    """And the same in the other direction, so no Neo4j work is left dangling."""
+    core_cancelled = False
+
+    class _SlowGraph:
+        async def ainvoke(self, state, config):
+            nonlocal core_cancelled
+            try:
+                await asyncio.sleep(0.5)
+                return {"is_ok": True}
+            except asyncio.CancelledError:
+                core_cancelled = True
+                raise
+
+    async def literature_run(**kwargs):
+        await asyncio.sleep(0.01)
+        raise RuntimeError("literature orchestration bug")
+
+    service = _service(literature_run)
+
+    with pytest.raises(RuntimeError, match="literature orchestration bug"):
+        await service._gather_core_and_literature(
+            graph=_SlowGraph(),
+            initial_state={},
+            config={},
+            question="What is EGFR?",
+            payload=_payload(),
+            literature_callback=UsageMetricsCallback("session", strict=False),
+        )
+
+    await asyncio.sleep(0.6)
+    assert core_cancelled is True
+
+
+def test_usage_summary_merges_core_and_literature_totals():
+    """The response's `usage` must cover both handlers, not just the core one."""
+    service = AgentService.__new__(AgentService)
+
+    core = UsageMetricsCallback("session")
+    core.per_node_usage["generate_cypher"] = UsageRecord(
+        input_tokens=100, output_tokens=10, total_tokens=110, call_count=1
+    )
+    core.aggregated_usage.totals.add_usage(
+        {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
+    )
+    core.aggregated_usage.register_model("generate_cypher", "gpt-4o-mini")
+
+    literature = UsageMetricsCallback("session", strict=False)
+    literature.per_node_usage["paperclip.router"] = UsageRecord(
+        input_tokens=5, output_tokens=1, total_tokens=6, call_count=1
+    )
+    literature.aggregated_usage.totals.add_usage(
+        {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+    )
+    literature.aggregated_usage.register_model("paperclip.router", "gpt-4o-mini")
+
+    merged = service._usage_summary(core, literature)
+
+    assert merged["aggregated_usage"]["totals"]["total_tokens"] == 116
+    assert set(merged["per_node_usage"]) == {"generate_cypher", "paperclip.router"}
+    # With no literature handler the shape is unchanged from before.
+    assert service._usage_summary(core, None) == core.get_summary()

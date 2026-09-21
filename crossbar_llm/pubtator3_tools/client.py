@@ -7,7 +7,7 @@ orchestration lives in `crossbar_llm.pubtator3_tools.agent`.
 API docs: https://www.ncbi.nlm.nih.gov/research/pubtator3/api
 """
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Any, Callable, Literal, TypeVar
+from typing import Any, AsyncContextManager, Callable, Literal, TypeVar
 import httpx
 import asyncio
 import logging
@@ -205,8 +205,34 @@ def _client() -> httpx.AsyncClient:
         _clients_by_loop[loop] = cli
     return cli
 
-def _limiter() -> AsyncLimiter:
-    """Lazy per-loop rate limiter — RATE_LIMIT_PER_SECOND req/s, IP-wide."""
+# Swappable limiter backend. The default below is correct for ONE process; the
+# 3 req/s ceiling is NCBI's IP-wide policy, so several replicas behind one
+# egress IP each enforcing it independently means NCBI sees 3 x replicas. Point
+# this at a shared implementation (see `rate_limit.py`) before running more
+# than one instance.
+_limiter_factory: "Callable[[], AsyncContextManager[Any]] | None" = None
+
+
+def set_limiter_factory(factory: "Callable[[], AsyncContextManager[Any]] | None") -> None:
+    """Install a shared rate limiter, or pass None to restore the default.
+
+    The factory is called per request and must return an async context manager
+    that blocks until a token is available. It is a factory rather than a single
+    instance because the default is bound to the running event loop.
+    """
+    global _limiter_factory
+    _limiter_factory = factory
+
+
+def _limiter():
+    """The rate limiter guarding every PubTator3 call.
+
+    Falls back to a lazy per-loop `AsyncLimiter` — per-loop because an
+    AsyncLimiter binds to the loop that created it, so a module-level instance
+    would break across `asyncio.run` calls in tests and scripts.
+    """
+    if _limiter_factory is not None:
+        return _limiter_factory()
     loop = asyncio.get_running_loop()
     lim = _limiters_by_loop.get(loop)
     if lim is None:

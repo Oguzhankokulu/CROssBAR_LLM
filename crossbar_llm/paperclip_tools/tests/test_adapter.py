@@ -500,12 +500,18 @@ async def test_slow_command_uses_slow_timeout_on_rest(monkeypatch):
 
     _patch_rest(monkeypatch, fake_post)
 
-    adapter = PaperclipAdapter(timeout_s=60.0, slow_timeout_s=300.0)
+    adapter = PaperclipAdapter(timeout_s=60.0, slow_timeout_s=300.0, pool_timeout_s=10.0)
     await adapter._run_rest("search", '"x" -n 5')
-    assert captured["timeout"] == 60.0
+    # Now an httpx.Timeout rather than a bare float, so that waiting for a free
+    # connection gets its own short budget instead of inheriting this one — but
+    # the per-call budget itself is unchanged.
+    assert captured["timeout"].read == 60.0
+    assert captured["timeout"].connect == 60.0
+    assert captured["timeout"].pool == 10.0
 
     await adapter._run_rest("map", '--from s_x "q"')
-    assert captured["timeout"] == 300.0
+    assert captured["timeout"].read == 300.0
+    assert captured["timeout"].pool == 10.0
 
 
 # --- sql routing (docs/paperclip_rest_endpoint_findings.md §12) --------------

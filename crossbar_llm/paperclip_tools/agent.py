@@ -257,6 +257,7 @@ def build_graph(
                         "Return ONLY a valid JSON object for that schema. Do not use "
                         "Markdown, prose, tool calls, or extra keys."
                     ),
+                    metadata={"node_name": "paperclip.router"},
                 )
                 if used_json_fallback:
                     warnings.append(
@@ -338,11 +339,14 @@ def build_graph(
                 ),
             ])
             chain = prompt | chat_model
-            msg = await chain.ainvoke({
-                "question": state["question"],
-                "evidence": evidence,
-                "chat_history": state.get("chat_history", []),
-            })
+            msg = await chain.ainvoke(
+                {
+                    "question": state["question"],
+                    "evidence": evidence,
+                    "chat_history": state.get("chat_history", []),
+                },
+                config={"metadata": {"node_name": "paperclip.synthesize"}},
+            )
             answer = msg.content if isinstance(msg.content, str) else str(msg.content)
         answer, degenerate_runs = _collapse_degenerate_runs(answer)
         if degenerate_runs:
@@ -396,6 +400,7 @@ def build_graph(
                         "Return ONLY a valid JSON object for the depth-evaluation "
                         "schema. Do not use Markdown, prose, tool calls, or extra keys."
                     ),
+                    metadata={"node_name": "paperclip.evaluate_depth"},
                 )
                 if used_json_fallback:
                     warnings.append(
@@ -427,7 +432,13 @@ def build_graph(
             "warnings": warnings,
         }
 
-    def _post_evaluate_route(state: PaperclipState) -> str:
+    async def _question_type_route(state: PaperclipState) -> str:
+        return state["question_type"]
+
+    async def _post_sql_route(state: PaperclipState) -> str:
+        return "search" if state.get("sql_error") else "synthesize"
+
+    async def _post_evaluate_route(state: PaperclipState) -> str:
         if state.get("depth_sufficient", True):
             return "end"
         if not state.get("refinement_attempted"):
@@ -446,7 +457,7 @@ def build_graph(
     g.set_entry_point("router")
     g.add_conditional_edges(
         "router",
-        lambda s: s["question_type"],
+        _question_type_route,
         {
             "out_of_scope": END,
             "keyword_search": "search",
@@ -462,7 +473,7 @@ def build_graph(
     # same shape as search_node's own zero-result fallback.
     g.add_conditional_edges(
         "sql",
-        lambda s: "search" if s.get("sql_error") else "synthesize",
+        _post_sql_route,
         {"search": "search", "synthesize": "synthesize"},
     )
     g.add_edge("search", "filter")

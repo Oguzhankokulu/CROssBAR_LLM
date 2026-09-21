@@ -63,7 +63,10 @@ class _StructuredNoneChatModel:
         self.responses = responses
 
     def with_structured_output(self, schema, **kwargs):
-        return RunnableLambda(lambda _: None)
+        async def _return_none(_):
+            return None
+
+        return RunnableLambda(_return_none)
 
     async def __call__(self, _input):
         return AIMessage(content=self.responses.pop(0))
@@ -1046,4 +1049,3 @@ async def test_router_guard_can_be_disabled(httpx_mock, fx):
     assert chat_model.calls == 1
     assert final["question_type"] == "relation_partner_discovery"
     assert not any("downgraded" in w for w in final["warnings"])
-
