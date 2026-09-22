@@ -50,22 +50,29 @@ class LiteratureService:
         # Keep the adapter long-lived once used, but do not construct it for
         # requests that leave Paperclip disabled.
         self.paperclip_adapter: PaperclipAdapter | None = None
-        # Admission control. Every run fans out several upstream requests, so
-        # concurrent traffic multiplies through to Paperclip and PubTator3 and
-        # drains the shared connection pool. Created lazily because a Semaphore
-        # binds to the running loop.
-        self._admission: asyncio.Semaphore | None = None
+        # Admission control, one semaphore per tool. The tools are bottlenecked
+        # by different things (Paperclip by its connection pool and server-side
+        # limit, PubTator3 by NCBI's IP-wide rate), so one shared pool only let
+        # each tool's users take capacity from the other's. Created lazily
+        # because a Semaphore binds to the running loop.
+        self._admission: dict[str, asyncio.Semaphore] = {}
         # Divide PubTator3's IP-wide budget across replicas. Configured once at
         # construction rather than per request: the limiter is process-global
         # state inside the client.
         install_static_share_limiter(settings.pubtator3_replica_count)
 
-    def _admission_slot(self) -> asyncio.Semaphore:
-        if self._admission is None:
-            self._admission = asyncio.Semaphore(
-                self.settings.literature_max_concurrent_runs
-            )
-        return self._admission
+    def _admission_limit(self, name: str) -> int | None:
+        return getattr(self.settings, f"{name}_max_concurrent_runs", None)
+
+    def _admission_slot(self, name: str) -> asyncio.Semaphore | None:
+        """The tool's semaphore, or None when that tool has no local limit."""
+        limit = self._admission_limit(name)
+        if limit is None:
+            return None
+        slot = self._admission.get(name)
+        if slot is None:
+            slot = self._admission[name] = asyncio.Semaphore(limit)
+        return slot
 
     async def _run_admitted(
         self,
@@ -74,23 +81,28 @@ class LiteratureService:
     ) -> dict[str, Any]:
         """Run one tool, but only once this process has capacity for it.
 
-        Waiting is deliberately brief. A long queue here would be charged
-        against the per-tool timeout, so an overloaded server would report
-        every tool as "timed out" when the truth is that it never started.
+        Two phases, strictly in sequence: queue for a slot (at most
+        `literature_admission_wait_seconds`), then run (at most
+        `literature_tool_timeout_seconds`). The run's timeout starts only once
+        a slot is granted, so queueing never shortens a run's budget — a longer
+        wait trades response time for more requests served, and nothing else.
         """
-        try:
-            await asyncio.wait_for(
-                self._admission_slot().acquire(),
-                timeout=self.settings.literature_admission_wait_seconds,
-            )
-        except asyncio.TimeoutError:
-            raise _AdmissionRejected(name) from None
+        slot = self._admission_slot(name)
+        if slot is not None:
+            try:
+                await asyncio.wait_for(
+                    slot.acquire(),
+                    timeout=self.settings.literature_admission_wait_seconds,
+                )
+            except asyncio.TimeoutError:
+                raise _AdmissionRejected(name) from None
         try:
             return await asyncio.wait_for(
                 runner(), timeout=self.settings.literature_tool_timeout_seconds
             )
         finally:
-            self._admission_slot().release()
+            if slot is not None:
+                slot.release()
 
     def _get_paperclip_adapter(self) -> PaperclipAdapter:
         # No await between the check and the assignment, so concurrent requests
@@ -108,6 +120,7 @@ class LiteratureService:
                 ),
                 disable_rest=getattr(env_settings, "paperclip_disable_rest", None),
                 max_connections=self.settings.paperclip_max_connections,
+                pool_timeout_s=self.settings.paperclip_pool_timeout_seconds,
             )
         return self.paperclip_adapter
 
@@ -328,19 +341,20 @@ class LiteratureService:
             if isinstance(raw, _AdmissionRejected):
                 # Not a failure of the tool — this server was saturated. Says
                 # so plainly so the operator sees capacity, not flakiness.
+                limit = self._admission_limit(name)
                 logger.warning(
                     "Literature tool not admitted",
                     event_type="literature_tool_not_admitted",
                     component="LiteratureService.run",
                     tool=name,
-                    max_concurrent=self.settings.literature_max_concurrent_runs,
+                    max_concurrent=limit,
+                    waited_seconds=self.settings.literature_admission_wait_seconds,
                 )
                 normalized[name] = LiteratureToolResult(
                     status="skipped",
                     warnings=[
-                        f"{name} was skipped: the server is at its literature "
-                        f"capacity of {self.settings.literature_max_concurrent_runs} "
-                        "concurrent runs. Try again shortly."
+                        f"{name} was skipped: the server is at its capacity of "
+                        f"{limit} concurrent {name} runs. Try again shortly."
                     ],
                 )
                 continue

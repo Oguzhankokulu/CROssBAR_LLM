@@ -28,9 +28,15 @@ Design notes:
   `PaperclipRestUnavailable` internally, caught by `_execute`/`search` to
   trigger the MCP fallback — they never escape this module as that type.
 
-No client-side rate limiter is applied: Paperclip publishes no request-rate
-policy, so throttling would be guesswork. Add one here if the server later
-documents limits.
+Paperclip documents per-account limits (https://paperclip.gxl.ai/docs): 10
+short commands in flight, 8 long ones, 120 req/s, and 100 `map`/`verify` a
+day. Tested live against this REST endpoint (2026-09-22), metadata reads were
+not limited even at 30 at once, but searches share an undocumented per-user
+queue: 10 concurrent searches succeeded, 15 drew 429 "Per-user search queue is
+full (6/6)" with Retry-After: 15. The REST pool defaults to 10, which keeps
+concurrent searches within that; excess commands queue for a connection rather
+than being sent. Pool exhaustion deliberately does NOT fall back to MCP, which
+Paperclip counts against the same account.
 
 CLI facts pinned against the live server:
 - `search -s <source> "<query>" -n <N>` — over MCP, the `-s` source flag is
@@ -62,6 +68,12 @@ MCP_URL = "https://paperclip.gxl.ai/mcp"
 # if this endpoint ever changes or locks down.
 REST_URL = "https://paperclip.gxl.ai/api/cli/execute"
 DISABLE_REST_ENV = "PAPERCLIP_DISABLE_REST"
+# Paperclip's documented limit on short commands (search, cat, sql, ...)
+# in flight at once, PER ACCOUNT, shared by every session, machine, SDK
+# client and MCP connection using the key: https://paperclip.gxl.ai/docs
+# Live (2026-09-22) the binding limit was the per-user search queue instead;
+# 10 concurrent searches passed, 15 did not. See the module docstring.
+ACCOUNT_MAX_SHORT_IN_FLIGHT = 10
 API_KEY_ENV = "PAPERCLIP_API_KEY"
 DEFAULT_TIMEOUT_S = 60.0            # search/cat/head/ls — typically fast
 # `map`/`ask-image` read full text server-side and can take minutes. 480s, not
@@ -909,18 +921,16 @@ class PaperclipAdapter:
         slow_timeout_s: float = SLOW_TIMEOUT_S,
         api_key: str | None = None,
         disable_rest: bool | None = None,
-        max_connections: int = 32,
-        pool_timeout_s: float = 10.0,
+        max_connections: int = ACCOUNT_MAX_SHORT_IN_FLIGHT,
+        pool_timeout_s: float = 60.0,
     ):
         self._timeout_s = timeout_s
         self._slow_timeout_s = slow_timeout_s
-        # How long a call may wait for a free connection when the pool is
-        # saturated. Kept well below the call timeouts on purpose: passing a
-        # bare float to httpx sets connect/read/write/pool to the SAME value,
-        # so queueing silently consumed the whole 60s (or 480s) budget and
-        # surfaced as "Paperclip is slow" rather than "we are out of
-        # connections". A short, separate pool timeout makes saturation fail
-        # fast and legibly.
+        # How long a call may queue for a free connection. Set separately from
+        # the call timeouts because a bare float makes httpx apply ONE value
+        # to connect/read/write/pool alike. With the pool sized to Paperclip's
+        # per-account limit (below), this wait IS our queue for that limit, so
+        # it is long enough for a burst to drain rather than fail.
         self._pool_timeout_s = pool_timeout_s
         # Explicit credentials beat the environment. Callers that load config
         # from a file (the API reads `.env` through pydantic-settings, which
@@ -933,9 +943,12 @@ class PaperclipAdapter:
         # an AsyncClient binds to the loop it was created on; per-adapter
         # because an adapter may be either request-scoped (`build_graph`
         # constructs one per run when none is injected) or process-wide (the
-        # API injects a single long-lived adapter). `max_connections` is a cap
-        # on THIS adapter, so a shared one needs it raised: it then bounds
-        # every concurrent request at once rather than one request's fan-out.
+        # API injects a single long-lived adapter). `max_connections` caps
+        # THIS adapter's commands in flight, one per connection under
+        # HTTP/1.1. It defaults to 10: Paperclip's documented per-account
+        # limit, and the level live testing showed keeps concurrent searches
+        # clear of the per-user search queue. Limits are per account, not per
+        # adapter: several adapters or replicas on one key must split it.
         self._clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient]" = (
             weakref.WeakKeyDictionary()
         )
@@ -1050,14 +1063,16 @@ class PaperclipAdapter:
                 timeout=timeout,
             )
         except httpx.PoolTimeout as e:
-            # Distinct from an upstream failure: Paperclip is fine, we ran out
-            # of local connections. Raised as RestUnavailable so the caller's
-            # existing MCP fallback still applies, but named so the logs say
-            # which it was.
-            raise PaperclipRestUnavailable(
-                f"connection pool exhausted after {self._pool_timeout_s:g}s "
-                f"(max_connections={self._max_connections}); too many concurrent "
-                f"Paperclip requests in this process"
+            # Deliberately NOT PaperclipRestUnavailable, so `_execute` and
+            # `search` do not fall back to MCP. The pool is sized to Paperclip's
+            # per-account limit of commands in flight, and Paperclip counts MCP
+            # connections against that same account — so falling back would
+            # just send the overflow to Paperclip by another door and earn a
+            # 429 there. Waiting longer is the remedy: raise the pool timeout.
+            raise PaperclipError(
+                f"no free Paperclip connection after {self._pool_timeout_s:g}s "
+                f"(max_connections={self._max_connections}, sized to the "
+                f"account's commands-in-flight limit); server is saturated"
             ) from e
         except Exception as e:  # network errors, timeouts
             raise PaperclipRestUnavailable(f"{type(e).__name__}: {e}") from e

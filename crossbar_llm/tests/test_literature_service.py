@@ -291,10 +291,10 @@ def test_tool_usage_slices_by_node_name_prefix():
 
 
 @pytest.mark.asyncio
-async def test_admission_control_bounds_concurrent_runs(monkeypatch):
-    """Only `literature_max_concurrent_runs` tools may be in flight at once."""
+async def test_admission_limit_bounds_concurrent_runs_of_that_tool(monkeypatch):
+    """A tool's limit caps how many of ITS runs are in flight at once."""
     settings = _settings()
-    settings.literature_max_concurrent_runs = 1
+    settings.pubtator3_max_concurrent_runs = 1
     service = LiteratureService(settings)
 
     in_flight = 0
@@ -311,27 +311,34 @@ async def test_admission_control_bounds_concurrent_runs(monkeypatch):
         finally:
             in_flight -= 1
 
-    monkeypatch.setattr(service, "_run_paperclip", tool)
     monkeypatch.setattr(service, "_run_pubtator3", tool)
 
-    task = asyncio.create_task(
-        service.run(
-            question="test",
-            payload=_payload(LiteratureToolsConfig(paperclip=True, pubtator3=True)),
-            callback=UsageMetricsCallback("session", strict=False),
+    tasks = [
+        asyncio.create_task(
+            service.run(
+                question="test",
+                payload=_payload(LiteratureToolsConfig(pubtator3=True)),
+                callback=UsageMetricsCallback("session", strict=False),
+            )
         )
-    )
+        for _ in range(3)
+    ]
     await asyncio.sleep(0.05)
-    assert peak == 1, "both tools started despite a concurrency limit of 1"
+    assert peak == 1, "several runs started despite a limit of 1"
     release.set()
-    await task
+    await asyncio.gather(*tasks)
 
 
 @pytest.mark.asyncio
-async def test_saturation_reports_skipped_not_timed_out(monkeypatch):
-    """A rejected run must not masquerade as a slow upstream service."""
+async def test_tools_do_not_share_admission_capacity(monkeypatch):
+    """A saturated PubTator3 must not turn Paperclip users away.
+
+    With one shared pool, each tool's users took capacity from the other's even
+    though the two are bottlenecked by entirely different things.
+    """
     settings = _settings()
-    settings.literature_max_concurrent_runs = 1
+    settings.pubtator3_max_concurrent_runs = 1
+    settings.paperclip_max_concurrent_runs = 1
     settings.literature_admission_wait_seconds = 0.01
     service = LiteratureService(settings)
 
@@ -339,16 +346,128 @@ async def test_saturation_reports_skipped_not_timed_out(monkeypatch):
 
     async def blocker(*args, **kwargs):
         await release.wait()
+        return {"final_answer": "answer", "documents": [], "warnings": []}
+
+    async def paperclip(*args, **kwargs):
         return {"final_answer": "answer", "citations": [], "warnings": []}
 
-    monkeypatch.setattr(service, "_run_paperclip", blocker)
     monkeypatch.setattr(service, "_run_pubtator3", blocker)
+    monkeypatch.setattr(service, "_run_paperclip", paperclip)
 
-    # Occupy the only slot, then ask for both tools.
     hog = asyncio.create_task(
         service.run(
             question="test",
-            payload=_payload(LiteratureToolsConfig(paperclip=True)),
+            payload=_payload(LiteratureToolsConfig(pubtator3=True)),
+            callback=UsageMetricsCallback("session", strict=False),
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    result = await service.run(
+        question="test",
+        payload=_payload(LiteratureToolsConfig(paperclip=True, pubtator3=True)),
+        callback=UsageMetricsCallback("session", strict=False),
+    )
+
+    assert result["paperclip"].status == "completed"
+    assert result["pubtator3"].status == "skipped"
+    assert "pubtator3" in result["pubtator3"].warnings[0]
+    release.set()
+    await hog
+
+
+@pytest.mark.asyncio
+async def test_unlimited_tool_admits_every_run(monkeypatch):
+    """`None` means no local limit — every run starts immediately."""
+    settings = _settings()
+    settings.paperclip_max_concurrent_runs = None
+    settings.literature_admission_wait_seconds = 0.01
+    service = LiteratureService(settings)
+
+    started = 0
+    release = asyncio.Event()
+
+    async def tool(*args, **kwargs):
+        nonlocal started
+        started += 1
+        await release.wait()
+        return {"final_answer": "answer", "citations": [], "warnings": []}
+
+    monkeypatch.setattr(service, "_run_paperclip", tool)
+
+    tasks = [
+        asyncio.create_task(
+            service.run(
+                question="test",
+                payload=_payload(LiteratureToolsConfig(paperclip=True)),
+                callback=UsageMetricsCallback("session", strict=False),
+            )
+        )
+        for _ in range(25)
+    ]
+    await asyncio.sleep(0.05)
+    assert started == 25
+    release.set()
+    results = await asyncio.gather(*tasks)
+    assert all(r["paperclip"].status == "completed" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_admission_wait_does_not_shorten_the_run_budget(monkeypatch):
+    """Queueing for a slot must not be charged against the run's timeout.
+
+    The run timeout starts only once a slot is granted. Here a run queues for
+    longer than the entire run timeout and must still complete, because its
+    own clock hasn't started yet while it waits.
+    """
+    settings = _settings(timeout=0.3)
+    settings.pubtator3_max_concurrent_runs = 1
+    settings.literature_admission_wait_seconds = 2.0
+    service = LiteratureService(settings)
+
+    async def tool(*args, **kwargs):
+        await asyncio.sleep(0.25)  # just inside the 0.3s run budget
+        return {"final_answer": "answer", "documents": [], "warnings": []}
+
+    monkeypatch.setattr(service, "_run_pubtator3", tool)
+
+    # Two runs through one slot: the second queues ~0.25s, then runs 0.25s.
+    # Its total (~0.5s) exceeds the 0.3s run timeout, so it would fail if
+    # queueing were charged against that budget.
+    results = await asyncio.gather(
+        *(
+            service.run(
+                question="test",
+                payload=_payload(LiteratureToolsConfig(pubtator3=True)),
+                callback=UsageMetricsCallback("session", strict=False),
+            )
+            for _ in range(2)
+        )
+    )
+
+    assert [r["pubtator3"].status for r in results] == ["completed", "completed"]
+
+
+@pytest.mark.asyncio
+async def test_saturation_reports_skipped_not_timed_out(monkeypatch):
+    """A run that never got a slot must not masquerade as a slow upstream."""
+    settings = _settings()
+    settings.pubtator3_max_concurrent_runs = 1
+    settings.literature_admission_wait_seconds = 0.01
+    service = LiteratureService(settings)
+
+    release = asyncio.Event()
+
+    async def blocker(*args, **kwargs):
+        await release.wait()
+        return {"final_answer": "answer", "documents": [], "warnings": []}
+
+    monkeypatch.setattr(service, "_run_pubtator3", blocker)
+
+    hog = asyncio.create_task(
+        service.run(
+            question="test",
+            payload=_payload(LiteratureToolsConfig(pubtator3=True)),
             callback=UsageMetricsCallback("session", strict=False),
         )
     )
