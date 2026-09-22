@@ -298,3 +298,58 @@ def test_usage_summary_merges_core_and_literature_totals():
     assert set(merged["per_node_usage"]) == {"generate_cypher", "paperclip.router"}
     # With no literature handler the shape is unchanged from before.
     assert service._usage_summary(core, None) == core.get_summary()
+
+
+def test_relevance_is_revalidated_for_each_question_in_a_session():
+    """A session's checkpointer carries state between questions, and the
+    relevance node skips itself when a verdict is present. Unless each
+    question's initial state clears the verdict, question 2 silently inherits
+    question 1's — letting an off-topic question through, or turning a valid
+    one away."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    from crossbar_llm.agent_tools.cypher_agent import CypherAgentState
+    from crossbar_llm.api.schemas.common import SearchMode
+
+    judged = []
+
+    class _FakeValidator:
+        def invoke(self, messages, config=None):
+            question = messages[-1].content
+            judged.append(question)
+            return {
+                "parsed": SimpleNamespace(
+                    relevant="stock" not in question, reason="test verdict"
+                )
+            }
+
+    agent = object.__new__(CypherAgent)
+    agent.llm_factory = SimpleNamespace(
+        create_biological_relevance_validator_llm=lambda: _FakeValidator()
+    )
+    builder = StateGraph(CypherAgentState)
+    builder.add_node("relevance", agent.biological_relevance_validation_node)
+    builder.add_edge(START, "relevance")
+    builder.add_edge("relevance", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+
+    service = AgentService.__new__(AgentService)
+    config = {"configurable": {"thread_id": "one-session"}}
+
+    def ask(question):
+        return graph.invoke(
+            service._base_state(
+                question=question,
+                execution_mode="generate_and_run",
+                cypher_mode=SearchMode.DB_SEARCH,
+            ),
+            config,
+        )
+
+    first = ask("What is the role of EGFR in cancer?")
+    second = ask("What is Apple's stock price today?")
+
+    assert first["biological_relevance"] is True
+    assert len(judged) == 2, "second question reused the first question's verdict"
+    assert second["biological_relevance"] is False

@@ -210,6 +210,11 @@ class AgentService:
         
         return {
             "question": question,
+            # Reset per question. The session checkpointer carries every key
+            # forward between questions, and the relevance node skips itself
+            # when a verdict is already present — so a stale verdict here would
+            # silently apply the PREVIOUS question's relevance to this one.
+            "biological_relevance": None,
             "resolved_entities": None,
             "cypher_mode": cypher_mode,
             "vector_index": vector_index,
